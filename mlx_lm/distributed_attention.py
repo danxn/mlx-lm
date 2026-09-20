@@ -379,6 +379,42 @@ def sharded_query_attention(
     )
 
 
+def sharded_batch_decode_attention(
+    queries,
+    keys_shard,
+    values_shard,
+    scale: float,
+    group: Any,
+    suffix=None,
+    softcap: Optional[float] = None,
+):
+    """One new token for each of B questions against the same sharded past.
+
+    The B queries form one matrix, so this rank reads its shard once for all
+    questions. ``suffix`` is ``(keys, values, lengths)`` with the own tokens of
+    every question, on the rank that keeps them, and ``None`` on the others.
+    """
+    B, H, L, D = queries.shape
+    assert L == 1, "batch decode takes one token per question"
+    if _has_keys(keys_shard):
+        rows = mx.transpose(queries, (2, 1, 0, 3))
+        part = local_partial_attention(
+            rows, keys_shard, values_shard, scale, softcap=softcap
+        )
+        part = tuple(mx.transpose(x, (2, 1, 0, 3)) for x in part)
+    else:
+        part = _empty_partial(queries)
+    if suffix is not None:
+        keys, values, lengths = suffix
+        valid = mx.arange(keys.shape[2])[None, :] < lengths[:, None]
+        mask = valid[:, None, None, None, :] if H != keys.shape[1] else valid[:, None, None, :]
+        own = _partial_attention_tile(
+            queries, keys, values, scale, mask=mask, softcap=softcap
+        )
+        part = combine_partial_local(part, own)
+    return merge_partial_attention(*part, group)
+
+
 def _causal_block_mask(q_len: int, k_len: int):
     q_idx = mx.arange(q_len)[:, None]
     k_idx = mx.arange(k_len)[None, :]

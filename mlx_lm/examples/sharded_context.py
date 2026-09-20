@@ -31,6 +31,7 @@ import mlx.core as mx
 
 from mlx_lm import load
 from mlx_lm.sharded_prompt_cache import (
+    batch_query_scope,
     block_owners,
     block_ranges,
     load_sharded_cache,
@@ -111,9 +112,37 @@ def answer(model, tokenizer, caches, question_ids, base, set_position, max_token
     return tokenizer.decode(tokens)
 
 
+def answer_batch(model, tokenizer, batch_caches, logits, max_tokens):
+    """Greedy answers for all questions of a batch, one token each per step."""
+    stop = stop_tokens(tokenizer)
+    tokens = [[] for _ in range(logits.shape[0])]
+    done = [False] * len(tokens)
+    for step in range(max_tokens):
+        nxt = mx.argmax(logits, axis=-1).astype(mx.int32)
+        mx.eval(nxt)  # evaluate every pass before the next one
+        for i, token in enumerate(nxt.tolist()):
+            if not done[i]:
+                if token in stop:
+                    done[i] = True
+                else:
+                    tokens[i].append(token)
+        if all(done) or step == max_tokens - 1:
+            break
+        logits = model(nxt[:, None], cache=batch_caches)[:, -1, :]
+    return [tokenizer.decode(t) for t in tokens]
+
+
 def ask(args, model, tokenizer, group):
     caches, meta = load_sharded_cache(os.path.join(args.cache_dir, "context"), group)
     base, tail = meta["total_tokens"], meta["extra"]["tail"]
+    if args.batch:
+        ids = [tokenizer.encode(" " + q + tail, add_special_tokens=False) for q in args.question]
+        with batch_query_scope(model, caches, base, ids, args.max_tokens) as (bc, logits):
+            texts = answer_batch(model, tokenizer, bc, logits, args.max_tokens)
+        if group.rank() == 0:
+            for question, text in zip(args.question, texts):
+                print(f"Q: {question}\nA: {text.strip()}", flush=True)
+        return
     for question in args.question:
         question_ids = tokenizer.encode(" " + question + tail, add_special_tokens=False)
         with query_scope(caches, base) as set_position:
@@ -132,6 +161,11 @@ def main():
     parser.add_argument("--file", help="Text file with the document (prepare).")
     parser.add_argument(
         "--question", action="append", help="Question (ask). Repeat for several."
+    )
+    parser.add_argument(
+        "--batch",
+        action="store_true",
+        help="Answer all questions together. The shard is read once for all of them.",
     )
     parser.add_argument("--max-tokens", type=int, default=256)
     parser.add_argument("--block-size", type=int, default=2048)

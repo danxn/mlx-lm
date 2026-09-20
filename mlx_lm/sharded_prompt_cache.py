@@ -18,7 +18,14 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import mlx.core as mx
 
-from .models.cache import KVCache, load_prompt_cache, make_prompt_cache, save_prompt_cache
+from .models.cache import (
+    BatchRotatingKVCache,
+    KVCache,
+    RotatingKVCache,
+    load_prompt_cache,
+    make_prompt_cache,
+    save_prompt_cache,
+)
 from .models.sharded_cache import ShardedKVCache
 
 
@@ -276,3 +283,52 @@ def query_scope(caches: List[Any], base: int):
             c._query_offset = None
         for c, state in saved:
             c.state = state
+
+
+@contextmanager
+def batch_query_scope(model, caches: List[Any], base: int, questions, max_new: int):
+    """Decode several questions together against one prepared cache.
+
+    Each question first runs alone for a short prefill, as in ``query_scope``.
+    Then all questions form one batch: at every step each machine reads its
+    shard once for all of them. Yields ``(batch_caches, logits)``. ``logits`` has
+    one row per question. Give ``batch_caches`` to the model with one token per
+    question, at most ``max_new`` times, and evaluate every pass.
+    On exit the prepared cache is as it was.
+    """
+    sharded = [c for c in caches if isinstance(c, ShardedKVCache)]
+    for c in caches:
+        if not isinstance(c, (ShardedKVCache, RotatingKVCache)):
+            raise NotImplementedError(f"batch mode does not support {type(c).__name__}")
+    own = [[] for _ in sharded]
+    windows, rows = [], []
+    for question in questions:
+        marks = [c.local_offset for c in sharded]
+        with query_scope(caches, base):
+            logits = model(mx.array(question)[None], cache=caches)[:, -1, :]
+            mx.eval(logits)
+            for j, (c, mark) in enumerate(zip(sharded, marks)):
+                own[j].append(c.own_tokens(mark) if c.owns_new_token else None)
+            windows.append(
+                [_snapshot(c) for c in caches if not isinstance(c, ShardedKVCache)]
+            )
+            mx.eval([x for layer in own for pair in layer[-1:] if pair for x in pair])
+        rows.append(logits)
+
+    lengths = [len(q) for q in questions]
+    capacity = max(lengths) + max_new
+    batch_caches, j, w = [], 0, 0
+    for c in caches:
+        if isinstance(c, ShardedKVCache):
+            c.start_batch(base, own[j], lengths, capacity)
+            batch_caches.append(c)
+            j += 1
+        else:
+            singles = [RotatingKVCache.from_state(win[w]) for win in windows]
+            batch_caches.append(BatchRotatingKVCache.merge(singles))
+            w += 1
+    try:
+        yield batch_caches, mx.concatenate(rows, axis=0)
+    finally:
+        for c in sharded:
+            c.end_batch()

@@ -17,11 +17,13 @@ import unittest
 
 import mlx.core as mx
 
+from mlx_lm import distributed_attention, fast_decode_attention
 from mlx_lm.models import gemma3_text, gemma4_text
 from mlx_lm.models.cache import KVCache, QuantizedKVCache, make_prompt_cache
 from mlx_lm.models.sharded_cache import ShardedKVCache
 from mlx_lm.sharded_prompt_cache import (
     _backbone,
+    batch_query_scope,
     block_owners,
     block_ranges,
     load_sharded_cache,
@@ -235,6 +237,95 @@ class ShardedFamiliesTest(unittest.TestCase):
         for name in sorted(QUANTIZED_REFERENCE):
             with self.subTest(name):
                 self.check_family(name, kv_bits=8)
+
+
+class ShardedBatchTest(unittest.TestCase):
+    """Several questions decoded together give the same logits as one by one."""
+
+    STEPS = 3
+
+    def check_family(self, name, kv_bits=None, tol=TOL, context=100):
+        model = build(name)
+        ids = tokens(1, context)
+        questions = [tokens(2, 6), tokens(3, 4), tokens(4, 9)]
+        caches = sharded_prefill(model, ids, kv_bits)
+        base = len(ids)
+
+        forced, refs = [], []
+        for question in questions:
+            steps = greedy_tokens(model, ids, question, self.STEPS)
+            forced.append(steps)
+            refs.append(sharded_answer(model, caches, base, question, steps))
+
+        with batch_query_scope(model, caches, base, questions, self.STEPS) as (
+            batch_caches,
+            logits,
+        ):
+            outs = [logits]
+            for step in range(self.STEPS):
+                tokens_now = mx.array([[f[step]] for f in forced], dtype=mx.int32)
+                out = model(tokens_now, cache=batch_caches)[:, -1, :]
+                mx.eval(out)  # evaluate every pass before the next one
+                outs.append(out)
+        again = sharded_answer(model, caches, base, questions[0], forced[0])
+
+        for i in range(len(questions)):
+            got = [out[i : i + 1] for out in outs]
+            self.assertLess(max_diff(got, refs[i]), tol)
+            if kv_bits is None:
+                self.assertTrue(same_top_token(got, refs[i]))
+        # The prepared cache is the same after the batch.
+        self.assertLess(max_diff(again, refs[0]), 1e-5)
+
+    def test_families(self):
+        for name in FAMILIES:
+            with self.subTest(name):
+                self.check_family(name)
+
+    def test_quantized_cache(self):
+        self.check_family("qwen2", kv_bits=8, tol=5e-2)
+
+    def test_long_context(self):
+        # Every shard has more than 256 keys, so the fast kernels run.
+        for name in ("llama", "qwen2", "gemma3_text", "gemma4_plain"):
+            with self.subTest(name):
+                self.check_family(name, context=900)
+
+
+class FastKernelTest(unittest.TestCase):
+    """The Metal kernels give the same partial results as plain MLX operations."""
+
+    def check(self, dtype, heads, kv_heads, head_dim, rows, keys, tol):
+        mx.random.seed(keys + rows)
+        q = mx.random.normal((1, heads, rows, head_dim)).astype(dtype)
+        cache = mx.random.normal((1, kv_heads, keys + 64, head_dim)).astype(dtype)
+        k, v = cache[:, :, :keys], cache[:, :, ::-1][:, :, :keys]  # views like a cache buffer
+        if not fast_decode_attention.supported(q, k, v, None):
+            return False  # this shape uses the plain path
+        got = fast_decode_attention.fast_partial_attention(q, k, v, head_dim**-0.5)
+        ref = distributed_attention._partial_attention_tile(q, k, v, head_dim**-0.5)
+        mx.eval(got, ref)
+        self.assertLess(mx.max(mx.abs(got[2] / got[1] - ref[2] / ref[1])).item(), tol)
+        self.assertLess(mx.max(mx.abs(got[0] - ref[0])).item(), 10 * tol)
+        return True
+
+    def test_several_rows(self):
+        ran = 0
+        for dtype, tol in ((mx.float32, 1e-3), (mx.float16, 2e-2), (mx.bfloat16, 1e-1)):
+            for heads, kv_heads, head_dim in ((32, 8, 64), (8, 1, 128), (4, 4, 64)):
+                for rows in (2, 5, 8):
+                    for keys in (300, 1031, 4099):
+                        with self.subTest(dtype=dtype, heads=heads, head_dim=head_dim, rows=rows, keys=keys):
+                            ran += self.check(dtype, heads, kv_heads, head_dim, rows, keys, tol)
+        self.assertGreater(ran, 50)
+
+    def test_one_token(self):
+        ran = 0
+        for dtype, tol in ((mx.float32, 1e-3), (mx.float16, 2e-2)):
+            for keys in (300, 33001):
+                with self.subTest(dtype=dtype, keys=keys):
+                    ran += self.check(dtype, 32, 8, 64, 1, keys, tol)
+        self.assertEqual(ran, 4)
 
 
 class ShardedImagesTest(unittest.TestCase):

@@ -27,6 +27,7 @@ from mlx.utils import tree_map, tree_reduce
 
 from ..distributed_attention import (
     sharded_prefill_attention,
+    sharded_batch_decode_attention,
     sharded_query_attention,
     sharded_scaled_dot_product_attention,
 )
@@ -67,9 +68,18 @@ class ShardedKVCache(_BaseCache):
         # the same image attend to each other in both directions.
         self.image_groups = None
         self._query_offset: Optional[int] = None
+        # Batch mode: several questions decode together against this shard.
+        # ``batch_pos`` is the position of the next token of every question.
+        # The own tokens of the questions live in ``suffix_*`` on one rank.
+        self.batch_pos = None
+        self.batch_base = 0
+        self.suffix_keys = None
+        self.suffix_values = None
 
     @property
     def offset(self):
+        if self.batch_pos is not None:
+            return self.batch_pos
         if self._query_offset is not None:
             return self._query_offset
         return self.shard_start + self.local_offset
@@ -79,6 +89,8 @@ class ShardedKVCache(_BaseCache):
         self._query_offset = value
 
     def update_and_fetch(self, keys, values):
+        if self.batch_pos is not None:
+            return self._update_batch(keys, values)
         if not self.owns_new_token:
             return self.keys_and_values()
         if self.kv_bits is not None:
@@ -160,9 +172,59 @@ class ShardedKVCache(_BaseCache):
             )
         return self.keys, self.values
 
+    def own_tokens(self, start):
+        """Keys and values stored since ``start``, as plain arrays."""
+        keys, values = self.keys_and_values()
+
+        def take(x):
+            if self.kv_bits is None:
+                return mx.contiguous(x[..., start : self.local_offset, :])
+            part = tuple(a[..., start : self.local_offset, :] for a in x)
+            return mx.contiguous(
+                mx.dequantize(*part, group_size=self.group_size, bits=self.kv_bits)
+            )
+
+        return take(keys), take(values)
+
+    def start_batch(self, base, own, lengths, capacity):
+        """Switch to batch mode. ``own`` has (keys, values) of the tokens of each
+        question on the rank that keeps them, and ``None`` entries elsewhere."""
+        self.batch_base = base
+        self.batch_pos = mx.array([base + n for n in lengths])
+        if self.owns_new_token:
+            k0, v0 = own[0]
+            shape = (len(own), k0.shape[1], capacity)
+            self.suffix_keys = mx.zeros((*shape, k0.shape[3]), k0.dtype)
+            self.suffix_values = mx.zeros((*shape, v0.shape[3]), v0.dtype)
+            for i, (k, v) in enumerate(own):
+                self.suffix_keys[i : i + 1, :, : k.shape[2]] = k
+                self.suffix_values[i : i + 1, :, : v.shape[2]] = v
+
+    def end_batch(self):
+        self.batch_pos = None
+        self.suffix_keys = self.suffix_values = None
+
+    def _update_batch(self, keys, values):
+        if self.owns_new_token:
+            used = self.batch_pos - self.batch_base
+            slot = mx.arange(self.suffix_keys.shape[2])[None, :] == used[:, None]
+            slot = slot[:, None, :, None]
+            self.suffix_keys = mx.where(slot, keys, self.suffix_keys)
+            self.suffix_values = mx.where(slot, values, self.suffix_values)
+        self.batch_pos = self.batch_pos + 1
+        return self.keys_and_values()
+
     def attend(self, queries, keys, values, scale, softcap=None):
         """Attention of ``queries`` against the sharded context (this rank's
         ``keys``/``values`` are what ``update_and_fetch`` just returned)."""
+        if self.batch_pos is not None:
+            suffix = None
+            if self.owns_new_token:
+                lengths = self.batch_pos - self.batch_base
+                suffix = (self.suffix_keys, self.suffix_values, lengths)
+            return sharded_batch_decode_attention(
+                queries, keys, values, scale, self.group, suffix, softcap
+            )
         L = queries.shape[2]
         if L == 1:
             # Decode: every cached key is in the past, so no mask is needed.

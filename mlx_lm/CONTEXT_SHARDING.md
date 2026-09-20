@@ -62,6 +62,7 @@ Options of the example:
 | `--kv-bits {0,8,4}` | Cache precision. `0` keeps 16-bit values (default). |
 | `--weights 3,1` | Share of the cache for each machine. Use it for unequal machines. |
 | `--block-size N` | Tokens per prefill block (default 2048). |
+| `--batch` | Answer all `--question` options together (see below). |
 | `--backend` | Distributed backend (default `ring`). |
 
 The cache belongs to the exact text and to the number of machines used in
@@ -110,6 +111,64 @@ Rules for callers:
    or give wrong results.
 3. For a dialog, put the earlier questions and answers into the new question
    text. The prepared cache is never changed.
+
+## Several questions at once
+
+Many users can ask about the same prepared text. Answering them one by one reads
+the whole shard again for every question. `batch_query_scope` answers them
+together: at every step each machine reads its shard once for all questions.
+
+```python
+from mlx_lm.sharded_prompt_cache import batch_query_scope
+
+with batch_query_scope(model, caches, base, [ids_1, ids_2, ids_3], max_new) as (
+    batch_caches,
+    logits,  # one row per question
+):
+    # At each step give the model one token per question:
+    #   logits = model(next_tokens[:, None], cache=batch_caches)[:, -1, :]
+    # and evaluate the result before the next step.
+    ...
+```
+
+The example does this with `--batch` and several `--question` options.
+
+How it works:
+
+- Each question first runs alone for a short prefill, as in `query_scope`. This
+  keeps its own keys and values. Then all questions form one batch.
+- The queries of the batch are rows of one matrix. A Metal kernel loads the keys
+  and values once and uses the matrix instructions of the GPU (`simdgroup_matrix`)
+  for all rows. The tokens of each question stay on one machine, and the partial
+  results are merged as before.
+- Sliding-window layers (Gemma 3 and 4) get a copy of their window for each
+  question (`BatchRotatingKVCache`).
+- After the block, the prepared cache is as it was.
+
+Measured on an M3 Max, one process, Llama 3.2 1B 4-bit, 32768 tokens in the cache:
+
+| Questions in the batch | Tokens per second, all questions | Compared with one by one |
+|---|---|---|
+| 1 | 100 | 1.0x |
+| 2 | 197 | 2.0x |
+| 4 | 287 | 2.8x |
+| 8 | 374 | 3.7x |
+| 16 | 415 | 4.1x |
+
+The time of one step does not stay flat. At 8 questions a step takes 22 ms
+instead of 10 ms: attention grows from 5.8 to 13.4 ms, and the rest of the model
+(the stock quantized matrix multiplications) from 3.6 to 9.3 ms. The numbers change
+with the model and the context. They come from one process, so the GPU was shared.
+
+Limits of this first version:
+
+- The batch is fixed. All questions start together, and a question that has
+  finished still takes a row until all are done.
+- The prefill of the questions still runs one after another.
+- Only caches that are sharded `KVCache` layers or `RotatingKVCache` layers work.
+- The kernel takes up to 64 rows (heads of a group times questions). Larger
+  batches use a slower path.
+- The tokens of the questions are stored in 16-bit, even with an 8 or 4 bit cache.
 
 ## How it works
 
@@ -309,8 +368,9 @@ run with the same model on one machine, using ordinary caches: the logits and
 the top token after a question, after a second question (a rollback in
 between), and after saving and loading the cache. They also cover 8-bit caches,
 Gemma 4 layers that reuse keys and values, and pictures in Gemma 3 and 4. The
-picture tests also compare with a run that has no cache at all. The tests run
-with one process too, but then nothing is split.
+picture tests also compare with a run that has no cache at all. The batch tests
+compare several questions decoded together with the same questions one by one.
+The tests run with one process too, but then nothing is split.
 
 ## Limits and what is not verified
 
