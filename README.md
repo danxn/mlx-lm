@@ -8,6 +8,11 @@ models on Apple silicon with MLX.
 > fast decoding of several questions about the same text at once. It is not part of
 > the upstream project. See [Context sharding](#context-sharding-this-fork) below.
 
+![Several Mac minis and a laptop working as one local cluster](assets/Apple_Silicone_local_cluster.webp)
+
+*Concept illustration of a local Apple silicon cluster. The numbers on the screen
+are not measurements.*
+
 Some key features include:
 
 * Integration with the Hugging Face Hub to easily use thousands of LLMs with a
