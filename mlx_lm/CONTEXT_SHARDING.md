@@ -137,10 +137,11 @@ How it works:
 
 - Each question first runs alone for a short prefill, as in `query_scope`. This
   keeps its own keys and values. Then all questions form one batch.
-- The queries of the batch are rows of one matrix. A Metal kernel loads the keys
-  and values once and uses the matrix instructions of the GPU (`simdgroup_matrix`)
-  for all rows. The tokens of each question stay on one machine, and the partial
-  results are merged as before.
+- The queries of the batch are rows of one matrix. A Metal kernel reads each block of
+  keys and values once into threadgroup memory. All rows use it through the matrix
+  instructions of the GPU (`simdgroup_matrix`), 8 rows per simdgroup. The next block
+  is fetched while the current one is computed. The tokens of each question stay on
+  one machine, and the partial results are merged as before.
 - Sliding-window layers (Gemma 3 and 4) get a copy of their window for each
   question (`BatchRotatingKVCache`).
 - After the block, the prepared cache is as it was.
@@ -149,16 +150,26 @@ Measured on an M3 Max, one process, Llama 3.2 1B 4-bit, 32768 tokens in the cach
 
 | Questions in the batch | Tokens per second, all questions | Compared with one by one |
 |---|---|---|
-| 1 | 100 | 1.0x |
-| 2 | 197 | 2.0x |
-| 4 | 287 | 2.8x |
-| 8 | 374 | 3.7x |
-| 16 | 415 | 4.1x |
+| 1 | 88 | 1.0x |
+| 2 | 174 | 1.9x |
+| 4 | 322 | 3.5x |
+| 8 | 461 | 5.1x |
+| 16 | 566 | 6.2x |
 
-The time of one step does not stay flat. At 8 questions a step takes 22 ms
-instead of 10 ms: attention grows from 5.8 to 13.4 ms, and the rest of the model
-(the stock quantized matrix multiplications) from 3.6 to 9.3 ms. The numbers change
-with the model and the context. They come from one process, so the GPU was shared.
+Time of one decode step in ms, split into attention and the rest of the model:
+
+| Questions | Whole step | Attention | Rest of the model |
+|---|---|---|---|
+| 1 | 10.9 | 7.4 | 3.5 |
+| 2 | 11.5 | 7.6 | 3.9 |
+| 4 | 12.3 | 6.7 | 5.6 |
+| 8 | 17.4 | 9.0 | 8.4 |
+| 16 | 28.0 | 16.5 | 11.5 |
+
+Attention stays nearly flat up to 8 questions. The rest of the model grows, because
+the stock quantized matrix multiplication of MLX becomes slower for 8 or more rows.
+The numbers change with the model and the context. They come from one process on a
+shared GPU, so they vary by about 10 to 20 percent.
 
 Limits of this first version:
 
