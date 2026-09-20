@@ -19,7 +19,7 @@ ENABLED = os.environ.get("MLX_LM_SHARD_FAST_DECODE", "1") != "0"
 MIN_KEYS = 256  # below this the plain path is as fast
 MAX_ROWS = 64  # query rows (heads of a group x tokens) that share one pass over the keys
 MATRIX_SMEM = 32000  # bytes of threadgroup memory the matrix kernel may use
-MATRIX_BK = 16  # keys per step of the matrix kernel
+MATRIX_BK = 32  # keys per step of the matrix kernel
 MIN_LOADERS = 4  # simdgroups per threadgroup, so that loading the keys is spread out
 MATRIX_MIN_KEYS_ONE_TOKEN = 32768  # below this a single token uses the scalar kernel
 
@@ -115,7 +115,7 @@ def _get_kernel():
 # Attention for several query rows with 8x8 matrix instructions. A simdgroup owns 8
 # rows, reads each key and value tile once, and multiplies whole tiles: scores for
 # 8 keys at a time, a softmax step over 32 keys, then the product with the values.
-_SOURCE_MATRIX = r"""
+_MATRIX_TEMPLATE = r"""
 constexpr int BK = BK_KEYS;                                 // keys per step
 constexpr int CPL = BK / 4;                                 // score columns per lane in the softmax
 constexpr int DT = D / 8;                                   // 8x8 tiles along the head dimension
@@ -176,31 +176,7 @@ float m_run = -3.4028234e38f;
 float l_run = 0;
 const float scale = scale_in[0];
 
-const long kstride = keys_strides[2];
-const long vstride = values_strides[2];
-const device T* kp = keys + kv_head * keys_strides[1];
-const device T* vp = values + kv_head * values_strides[1];
-const bool wide = (kstride % 8 == 0) && (vstride % 8 == 0) && (keys_strides[1] % 8 == 0) &&
-    (values_strides[1] % 8 == 0);
-
-constexpr int VPR = D * sizeof(T) / 16;                     // 16-byte vectors per row
-constexpr int NV = (BK * VPR + NTH - 1) / NTH;              // vectors per thread and step
-uint4 kreg[NV];
-uint4 vreg[NV];
-
-// Fetch the vectors of one step from device memory into registers, zero past the end.
-#define FETCH(FROM)                                                             \
-  for (int i = 0; i < NV; i++) {                                                \
-    const int e = tid + i * NTH;                                                \
-    const int r = e / VPR;                                                      \
-    const int c = (e - r * VPR) * (16 / sizeof(T));                             \
-    kreg[i] = uint4(0);                                                         \
-    vreg[i] = uint4(0);                                                         \
-    if (e < BK * VPR && (FROM) + r < end) {                                     \
-      kreg[i] = *(const device uint4*)(kp + ((FROM) + r) * kstride + c);        \
-      vreg[i] = *(const device uint4*)(vp + ((FROM) + r) * vstride + c);        \
-    }                                                                           \
-  }
+//@DECLS
 
 if (wide && start < end) {
   FETCH(start)
@@ -211,25 +187,7 @@ for (int pos = start; pos < end; pos += BK) {
   const int nsub = (valid + 7) / 8;
 
   threadgroup_barrier(mem_flags::mem_threadgroup);
-  if (wide) {
-    for (int i = 0; i < NV; i++) {
-      const int e = tid + i * NTH;
-      const int r = e / VPR;
-      const int c = (e - r * VPR) * (16 / sizeof(T));
-      if (e < BK * VPR) {
-        *(threadgroup uint4*)(ks + r * LD + c) = kreg[i];
-        *(threadgroup uint4*)(vs + r * LD + c) = vreg[i];
-      }
-    }
-  } else {
-    for (int e = tid; e < BK * D; e += NTH) {
-      const int r = e / D;
-      const int c = e - r * D;
-      const bool ok = pos + r < end;
-      ks[r * LD + c] = ok ? kp[(pos + r) * kstride + c] : T(0);
-      vs[r * LD + c] = ok ? vp[(pos + r) * vstride + c] : T(0);
-    }
-  }
+  //@STORE
   threadgroup_barrier(mem_flags::mem_threadgroup);
   if (wide && pos + BK < end) {
     FETCH(pos + BK)
@@ -321,7 +279,169 @@ if (active) {
 }
 """
 
+_MATRIX_DECLS_PLAIN = r"""const long kstride = keys_strides[2];
+const long vstride = values_strides[2];
+const device T* kp = keys + kv_head * keys_strides[1];
+const device T* vp = values + kv_head * values_strides[1];
+const bool wide = (kstride % 8 == 0) && (vstride % 8 == 0) && (keys_strides[1] % 8 == 0) &&
+    (values_strides[1] % 8 == 0);
+
+constexpr int VPR = D * sizeof(T) / 16;                     // 16-byte vectors per row
+constexpr int NV = (BK * VPR + NTH - 1) / NTH;              // vectors per thread and step
+uint4 kreg[NV];
+uint4 vreg[NV];
+
+// Fetch the vectors of one step from device memory into registers, zero past the end.
+#define FETCH(FROM)                                                             \
+  for (int i = 0; i < NV; i++) {                                                \
+    const int e = tid + i * NTH;                                                \
+    const int r = e / VPR;                                                      \
+    const int c = (e - r * VPR) * (16 / sizeof(T));                             \
+    kreg[i] = uint4(0);                                                         \
+    vreg[i] = uint4(0);                                                         \
+    if (e < BK * VPR && (FROM) + r < end) {                                     \
+      kreg[i] = *(const device uint4*)(kp + ((FROM) + r) * kstride + c);        \
+      vreg[i] = *(const device uint4*)(vp + ((FROM) + r) * vstride + c);        \
+    }                                                                           \
+  }
+"""
+
+_MATRIX_STORE_PLAIN = r"""  if (wide) {
+    for (int i = 0; i < NV; i++) {
+      const int e = tid + i * NTH;
+      const int r = e / VPR;
+      const int c = (e - r * VPR) * (16 / sizeof(T));
+      if (e < BK * VPR) {
+        *(threadgroup uint4*)(ks + r * LD + c) = kreg[i];
+        *(threadgroup uint4*)(vs + r * LD + c) = vreg[i];
+      }
+    }
+  } else {
+    for (int e = tid; e < BK * D; e += NTH) {
+      const int r = e / D;
+      const int c = e - r * D;
+      const bool ok = pos + r < end;
+      ks[r * LD + c] = ok ? kp[(pos + r) * kstride + c] : T(0);
+      vs[r * LD + c] = ok ? vp[(pos + r) * vstride + c] : T(0);
+    }
+  }
+"""
+
+_MATRIX_DECLS_QUANTIZED = r"""
+constexpr int EPW = 32 / BITS;                              // packed elements per 32-bit word
+constexpr int UW = 8 / EPW;                                 // words per 8 elements
+constexpr int UPR = D / 8;                                  // units of 8 elements per row
+constexpr int NV = (BK * UPR + NTH - 1) / NTH;              // units per thread and step
+const long kstride = kq_strides[2];
+const long vstride = vq_strides[2];
+const long ksstride = kscales_strides[2];
+const long vsstride = vscales_strides[2];
+const device uint32_t* kp = kq + kv_head * kq_strides[1];
+const device uint32_t* vp = vq + kv_head * vq_strides[1];
+const device T* ksp = kscales + kv_head * kscales_strides[1];
+const device T* kbp = kbiases + kv_head * kbiases_strides[1];
+const device T* vsp = vscales + kv_head * vscales_strides[1];
+const device T* vbp = vbiases + kv_head * vbiases_strides[1];
+const bool wide = true;
+
+uint2 kreg[NV];
+uint2 vreg[NV];
+float kscale_reg[NV];
+float kbias_reg[NV];
+float vscale_reg[NV];
+float vbias_reg[NV];
+
+// Fetch the packed units of one step and their scales, zero past the end (dequantises to 0).
+#define FETCH(FROM)                                                                  \
+  for (int i = 0; i < NV; i++) {                                                     \
+    const int e = tid + i * NTH;                                                     \
+    const int r = e / UPR;                                                           \
+    const int c = (e - r * UPR) * 8;                                                 \
+    kreg[i] = uint2(0);                                                              \
+    vreg[i] = uint2(0);                                                              \
+    kscale_reg[i] = 0;                                                               \
+    kbias_reg[i] = 0;                                                                \
+    vscale_reg[i] = 0;                                                               \
+    vbias_reg[i] = 0;                                                                \
+    if (e < BK * UPR && (FROM) + r < end) {                                          \
+      const long row = (FROM) + r;                                                   \
+      kreg[i].x = kp[row * kstride + c / EPW];                                       \
+      vreg[i].x = vp[row * vstride + c / EPW];                                       \
+      if (UW == 2) {                                                                 \
+        kreg[i].y = kp[row * kstride + c / EPW + 1];                                 \
+        vreg[i].y = vp[row * vstride + c / EPW + 1];                                 \
+      }                                                                              \
+      kscale_reg[i] = ksp[row * ksstride + c / GS];                                  \
+      kbias_reg[i] = kbp[row * ksstride + c / GS];                                   \
+      vscale_reg[i] = vsp[row * vsstride + c / GS];                                  \
+      vbias_reg[i] = vbp[row * vsstride + c / GS];                                   \
+    }                                                                                \
+  }
+"""
+
+_MATRIX_STORE_QUANTIZED = r"""  // unpack, scale and shift each unit of 8 values once here, so every row tile reads plain T
+  for (int i = 0; i < NV; i++) {
+    const int e = tid + i * NTH;
+    const int r = e / UPR;
+    const int c = (e - r * UPR) * 8;
+    if (e < BK * UPR) {
+      threadgroup T* kdst = ks + r * LD + c;
+      threadgroup T* vdst = vs + r * LD + c;
+      const float4 ksc = float4(kscale_reg[i]);
+      const float4 kbi = float4(kbias_reg[i]);
+      const float4 vsc = float4(vscale_reg[i]);
+      const float4 vbi = float4(vbias_reg[i]);
+      if (BITS == 8) {
+        for (int h = 0; h < 2; h++) {
+          const uint kw = h == 0 ? kreg[i].x : kreg[i].y;
+          const uint vw = h == 0 ? vreg[i].x : vreg[i].y;
+          *(threadgroup vec<T, 4>*)(kdst + 4 * h) = vec<T, 4>(fma(float4(as_type<uchar4>(kw)), ksc, kbi));
+          *(threadgroup vec<T, 4>*)(vdst + 4 * h) = vec<T, 4>(fma(float4(as_type<uchar4>(vw)), vsc, vbi));
+        }
+      } else {
+        // a byte holds two neighbours: low nibble first
+        const float4 klo = float4(as_type<uchar4>(kreg[i].x & 0x0F0F0F0Fu));
+        const float4 khi = float4(as_type<uchar4>((kreg[i].x >> 4) & 0x0F0F0F0Fu));
+        const float4 vlo = float4(as_type<uchar4>(vreg[i].x & 0x0F0F0F0Fu));
+        const float4 vhi = float4(as_type<uchar4>((vreg[i].x >> 4) & 0x0F0F0F0Fu));
+        const vec<T, 4> kl = vec<T, 4>(fma(klo, ksc, kbi));
+        const vec<T, 4> kh = vec<T, 4>(fma(khi, ksc, kbi));
+        const vec<T, 4> vl = vec<T, 4>(fma(vlo, vsc, vbi));
+        const vec<T, 4> vh = vec<T, 4>(fma(vhi, vsc, vbi));
+        for (int j = 0; j < 4; j++) {
+          *(threadgroup vec<T, 2>*)(kdst + 2 * j) = vec<T, 2>(kl[j], kh[j]);
+          *(threadgroup vec<T, 2>*)(vdst + 2 * j) = vec<T, 2>(vl[j], vh[j]);
+        }
+      }
+    }
+  }
+"""
+
+_SOURCE_MATRIX = _MATRIX_TEMPLATE.replace("//@DECLS", _MATRIX_DECLS_PLAIN).replace("//@STORE", _MATRIX_STORE_PLAIN)
+_SOURCE_MATRIX_QUANTIZED = (
+    _MATRIX_TEMPLATE.replace("//@DECLS", _MATRIX_DECLS_QUANTIZED)
+    .replace("//@STORE", _MATRIX_STORE_QUANTIZED)
+    .replace("keys_shape[2]", "kq_shape[2]")
+)
+
 _kernel_matrix = None
+_kernel_matrix_quantized = None
+
+
+def _get_kernel_matrix_quantized():
+    global _kernel_matrix_quantized
+    if _kernel_matrix_quantized is None:
+        _kernel_matrix_quantized = mx.fast.metal_kernel(
+            name="matrix_rows_attention_quantized",
+            input_names=[
+                "queries", "kq", "kscales", "kbiases", "vq", "vscales", "vbiases", "scale_in",
+            ],
+            output_names=["partial", "sums", "maxs"],
+            source=_SOURCE_MATRIX_QUANTIZED,
+            header=_HEADER,
+            ensure_row_contiguous=False,
+        )
+    return _kernel_matrix_quantized
 
 
 def _get_kernel_matrix():
@@ -344,12 +464,18 @@ def _matrix_smem_bytes(tiles: int, head_dim: int, itemsize: int) -> int:
     return shared + tiles * per_tile
 
 
+def _kv_shape(keys):
+    """Shape (B, KVH, N, ...) of a plain K/V array or of a quantized tuple."""
+    return keys[0].shape if isinstance(keys, tuple) else keys.shape
+
+
 def _use_matrix(queries, keys_shard) -> bool:
     B, H, L, D = queries.shape
-    rows = (H // keys_shard.shape[1]) * L
+    shape = _kv_shape(keys_shard)
+    rows = (H // shape[1]) * L
     if B != 1 or rows > MAX_ROWS:
         return False
-    if L == 1 and keys_shard.shape[2] < MATRIX_MIN_KEYS_ONE_TOKEN:
+    if L == 1 and shape[2] < MATRIX_MIN_KEYS_ONE_TOKEN and not isinstance(keys_shard, tuple):
         return False
     return _matrix_smem_bytes(-(-rows // 8), D, queries.dtype.size) <= MATRIX_SMEM
 
@@ -364,24 +490,50 @@ def _pick_blocks_matrix(n_keys: int) -> int:
     return min(64, max(8, n_keys // 1024))
 
 
+def _quantized_layout(queries, keys_shard, values_shard):
+    """(bits, group size) of a quantized K/V pair the kernel can read, else None."""
+    if not (isinstance(keys_shard, tuple) and isinstance(values_shard, tuple)):
+        return None
+    if len(keys_shard) != 3 or len(values_shard) != 3:
+        return None
+    D = queries.shape[-1]
+    bits = keys_shard[0].shape[-1] * 32 // D
+    group = D // keys_shard[1].shape[-1]
+    if bits not in (4, 8) or group % 8 != 0 or D % group != 0:
+        return None
+    if values_shard[0].shape[-1] != keys_shard[0].shape[-1] or values_shard[1].shape[-1] != keys_shard[1].shape[-1]:
+        return None
+    if any(x.dtype != queries.dtype for x in (keys_shard[1], keys_shard[2], values_shard[1], values_shard[2])):
+        return None
+    if keys_shard[0].dtype != mx.uint32 or values_shard[0].dtype != mx.uint32:
+        return None
+    return bits, group
+
+
 def supported(queries, keys_shard, values_shard, mask) -> bool:
-    if not ENABLED or mask is not None:
-        return False
-    if isinstance(keys_shard, tuple) or keys_shard is None:
+    if not ENABLED or mask is not None or keys_shard is None:
         return False
     if mx.default_device() != mx.gpu:
         return False
     B, H, L, D = queries.shape
-    KVH = keys_shard.shape[1]
-    if D not in (64, 128) or values_shard.shape[-1] != D or H % KVH != 0:
+    quantized = isinstance(keys_shard, tuple)
+    if quantized and _quantized_layout(queries, keys_shard, values_shard) is None:
         return False
-    if keys_shard.dtype != queries.dtype or values_shard.dtype != queries.dtype:
+    shape = _kv_shape(keys_shard)
+    KVH = shape[1]
+    if D not in (64, 128) or H % KVH != 0:
         return False
-    if keys_shard.shape[2] < MIN_KEYS:
+    if not quantized and (
+        values_shard.shape[-1] != D
+        or keys_shard.dtype != queries.dtype
+        or values_shard.dtype != queries.dtype
+    ):
+        return False
+    if shape[2] < MIN_KEYS:
         return False
     if _use_matrix(queries, keys_shard):
         return True
-    return L == 1 and H // KVH <= 32  # scalar kernel: one simdgroup per query head
+    return not quantized and L == 1 and H // KVH <= 32  # scalar kernel: one simdgroup per query head
 
 
 def fast_partial_attention(queries, keys_shard, values_shard, scale, blocks=None):
@@ -390,17 +542,35 @@ def fast_partial_attention(queries, keys_shard, values_shard, scale, blocks=None
     Shapes match ``local_partial_attention``: (B,H,L,1), (B,H,L,1), (B,H,L,D).
     """
     B, H, L, D = queries.shape
-    KVH = keys_shard.shape[1]
+    shape = _kv_shape(keys_shard)
+    KVH, N = shape[1], shape[2]
     G = H // KVH
-    N = keys_shard.shape[2]
     q = mx.contiguous(queries)
     if _use_matrix(queries, keys_shard):
         blocks = blocks or _pick_blocks_matrix(N)
         tiles = -(-G * L // 8)
         loaders = max(tiles, MIN_LOADERS)
-        partial, sums, maxs = _get_kernel_matrix()(
-            inputs=[q, keys_shard, values_shard, mx.array([scale], dtype=mx.float32)],
-            template=[("T", queries.dtype), ("D", D), ("G", G), ("L", L), ("NT", tiles), ("NW", loaders), ("BK_KEYS", MATRIX_BK)],
+        template = [
+            ("T", queries.dtype),
+            ("D", D),
+            ("G", G),
+            ("L", L),
+            ("NT", tiles),
+            ("NW", loaders),
+            ("BK_KEYS", MATRIX_BK),
+        ]
+        scale_in = mx.array([scale], dtype=mx.float32)
+        if isinstance(keys_shard, tuple):
+            bits, group = _quantized_layout(queries, keys_shard, values_shard)
+            kernel = _get_kernel_matrix_quantized()
+            inputs = [q, *keys_shard, *values_shard, scale_in]
+            template += [("BITS", bits), ("GS", group)]
+        else:
+            kernel = _get_kernel_matrix()
+            inputs = [q, keys_shard, values_shard, scale_in]
+        partial, sums, maxs = kernel(
+            inputs=inputs,
+            template=template,
             grid=(KVH * 32 * loaders, blocks, 1),
             threadgroup=(32 * loaders, 1, 1),
             output_shapes=[(B, H, L, blocks, D), (B, H, L, blocks), (B, H, L, blocks)],

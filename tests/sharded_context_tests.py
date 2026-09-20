@@ -291,6 +291,11 @@ class ShardedBatchTest(unittest.TestCase):
             with self.subTest(name):
                 self.check_family(name, context=900)
 
+    def test_long_context_quantized(self):
+        for bits in (8, 4):
+            with self.subTest(bits=bits):
+                self.check_family("llama", kv_bits=bits, tol=5e-2, context=900)
+
 
 class FastKernelTest(unittest.TestCase):
     """The Metal kernels give the same partial results as plain MLX operations."""
@@ -326,6 +331,36 @@ class FastKernelTest(unittest.TestCase):
                 with self.subTest(dtype=dtype, keys=keys):
                     ran += self.check(dtype, 32, 8, 64, 1, keys, tol)
         self.assertEqual(ran, 4)
+
+
+    def check_quantized(self, dtype, bits, group, heads, kv_heads, head_dim, rows, keys, tol):
+        mx.random.seed(keys + rows + bits)
+        q = mx.random.normal((1, heads, rows, head_dim)).astype(dtype)
+        cache = mx.random.normal((1, kv_heads, keys + 64, head_dim)).astype(dtype)
+        k = tuple(x[:, :, :keys] for x in mx.quantize(cache * 2, group_size=group, bits=bits))
+        v = tuple(x[:, :, :keys] for x in mx.quantize(cache[:, :, ::-1], group_size=group, bits=bits))
+        if not fast_decode_attention.supported(q, k, v, None):
+            return False
+        got = fast_decode_attention.fast_partial_attention(q, k, v, head_dim**-0.5)
+        ref = distributed_attention._partial_attention_tile_quantized(q, k, v, head_dim**-0.5)
+        mx.eval(got, ref)
+        self.assertLess(mx.max(mx.abs(got[2] / got[1] - ref[2] / ref[1])).item(), tol)
+        return True
+
+    def test_quantized_cache(self):
+        ran = 0
+        for dtype, tol in ((mx.float32, 1e-3), (mx.float16, 5e-2)):
+            for bits, group in ((8, 64), (4, 64), (8, 32), (4, 128)):
+                for heads, kv_heads, head_dim in ((32, 8, 64), (8, 1, 128)):
+                    if group > head_dim:
+                        continue
+                    for rows in (1, 3, 8):
+                        for keys in (300, 1031):
+                            with self.subTest(dtype=dtype, bits=bits, group=group, head_dim=head_dim, rows=rows, keys=keys):
+                                ran += self.check_quantized(
+                                    dtype, bits, group, heads, kv_heads, head_dim, rows, keys, tol
+                                )
+        self.assertGreater(ran, 40)
 
 
 class ShardedImagesTest(unittest.TestCase):

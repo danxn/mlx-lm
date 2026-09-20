@@ -171,6 +171,22 @@ the stock quantized matrix multiplication of MLX becomes slower for 8 or more ro
 The numbers change with the model and the context. They come from one process on a
 shared GPU, so they vary by about 10 to 20 percent.
 
+With a quantized cache (`--kv-bits 8` or `4`) the same kernel reads the packed
+values. It unpacks each block once, when the block is copied to threadgroup memory,
+so the cost of unpacking does not grow with the number of questions. The stock
+quantized matrix multiplication unpacks the values again for every row. Same model,
+32768 tokens in the cache, tokens per second for all questions:
+
+| Questions | 8-bit cache, before | 8-bit cache, now | 4-bit cache, before | 4-bit cache, now |
+|---|---|---|---|---|
+| 1 | 99 | 94 | 104 | 94 |
+| 4 | 124 | 324 | 126 | 319 |
+| 8 | 185 | 483 | 182 | 445 |
+| 16 | 310 | 601 | 298 | 567 |
+
+With one question the two paths take the same time. The kernel handles 8 and 4 bit
+values with group sizes that are a multiple of 8, and head sizes 64 and 128.
+
 Limits of this first version:
 
 - The batch is fixed. All questions start together, and a question that has
