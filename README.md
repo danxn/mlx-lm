@@ -54,6 +54,27 @@ can hold. Short questions then run against that cache, and nothing is written to
 it, so the prepared text stays as it was. Machines exchange one small message per
 layer and step, so plain TCP over Ethernet or Thunderbolt is enough.
 
+```text
+Large model                       Large context
+──────────────                    ────────────────
+weights > RAM of one Mac          KV > RAM of one Mac
+        │                                │
+        ▼                                ▼
+weight sharding                   context sharding
+        │                                │
+ Mac1: W₁                         Mac1: model + KV₁
+ Mac2: W₂                         Mac2: model + KV₂
+ Mac3: W₃                         Mac3: model + KV₃
+ Mac4: W₄                         Mac4: model + KV₄
+        │                                │
+        └───────────┬────────────────────┘
+                    ▼
+             one inference
+```
+
+The left side is what `mx.distributed` already offers in MLX LM. The right side is
+what this fork adds. Using both together was not tested.
+
 ```bash
 # On every machine, same text file. Two local processes for a first try:
 mlx.launch --hosts 127.0.0.1 -n 2 --backend ring -- \
