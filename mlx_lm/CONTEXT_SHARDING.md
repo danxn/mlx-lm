@@ -150,21 +150,21 @@ Measured on an M3 Max, one process, Llama 3.2 1B 4-bit, 32768 tokens in the cach
 
 | Questions in the batch | Tokens per second, all questions | Compared with one by one |
 |---|---|---|
-| 1 | 88 | 1.0x |
-| 2 | 174 | 1.9x |
-| 4 | 322 | 3.5x |
-| 8 | 461 | 5.1x |
-| 16 | 566 | 6.2x |
+| 1 | 94 | 1.0x |
+| 2 | 184 | 1.9x |
+| 4 | 335 | 3.5x |
+| 8 | 486 | 5.1x |
+| 16 | 620 | 6.5x |
 
 Time of one decode step in ms, split into attention and the rest of the model:
 
 | Questions | Whole step | Attention | Rest of the model |
 |---|---|---|---|
-| 1 | 10.9 | 7.4 | 3.5 |
-| 2 | 11.5 | 7.6 | 3.9 |
-| 4 | 12.3 | 6.7 | 5.6 |
-| 8 | 17.4 | 9.0 | 8.4 |
-| 16 | 28.0 | 16.5 | 11.5 |
+| 1 | 10.4 | 7.2 | 3.2 |
+| 2 | 11.1 | 7.5 | 3.6 |
+| 4 | 11.7 | 6.6 | 5.1 |
+| 8 | 16.8 | 7.4 | 9.4 |
+| 16 | 28.6 | 16.5 | 12.1 |
 
 Attention stays nearly flat up to 8 questions. The rest of the model grows, because
 the stock quantized matrix multiplication of MLX becomes slower for 8 or more rows.
