@@ -43,8 +43,11 @@ class BatchEngine:
         stop_tokens: Iterable[int] = (),
         capacity: int = 1024,
         max_batch: int = 16,
+        group=None,
     ):
-        """``capacity`` is the most tokens (question and answer) one question can have."""
+        """``capacity`` is the most tokens (question and answer) one question can have.
+        With ``group``, all machines use the tokens that machine 0 chose, so a tie
+        between two tokens cannot make them disagree."""
         for c in caches:
             if not isinstance(c, (ShardedKVCache, RotatingKVCache)):
                 raise NotImplementedError(f"batch mode does not support {type(c).__name__}")
@@ -54,6 +57,7 @@ class BatchEngine:
         self.stop_tokens = set(stop_tokens)
         self.capacity = capacity
         self.max_batch = max_batch
+        self.group = group
         self.sharded = [c for c in caches if isinstance(c, ShardedKVCache)]
         self.slots: List[_Slot] = []
         self.batch_caches: Optional[List[Any]] = None
@@ -73,8 +77,7 @@ class BatchEngine:
             logits, own, windows = prefill_question(
                 self.model, self.caches, self.base, question
             )
-        first = mx.argmax(logits, axis=-1).astype(mx.int32)
-        mx.eval(first)
+        first = self._agree(mx.argmax(logits, axis=-1).astype(mx.int32))
 
         if not self.slots:
             for c, pair in zip(self.sharded, own):
@@ -118,11 +121,19 @@ class BatchEngine:
         if self.slots:
             tokens = mx.array([[s.pending] for s in self.slots], dtype=mx.int32)
             logits = self.model(tokens, cache=self.batch_caches)[:, -1, :]
-            nxt = mx.argmax(logits, axis=-1).astype(mx.int32)
-            mx.eval(nxt)  # evaluate every pass before the next one
+            nxt = self._agree(mx.argmax(logits, axis=-1).astype(mx.int32))
             for slot, token in zip(self.slots, nxt.tolist()):
                 slot.pending = token
         return events
+
+    def _agree(self, tokens):
+        """Evaluate ``tokens`` and make every machine use the values of machine 0."""
+        if self.group is not None and self.group.size() > 1:
+            if self.group.rank() != 0:
+                tokens = tokens * 0  # keeps the link to the forward pass, which must run
+            tokens = mx.distributed.all_sum(tokens, group=self.group)
+        mx.eval(tokens)  # evaluate every pass before the next one
+        return tokens
 
     def cancel(self, uid):
         """Drop one running question, if it is still running."""

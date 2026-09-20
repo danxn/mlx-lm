@@ -327,7 +327,9 @@ class ContinuousBatchTest(unittest.TestCase):
     ARRIVALS = [(0, 11, 6, 8), (2, 12, 4, 5), (3, 13, 9, 8), (7, 14, 5, 6), (7, 15, 3, 4)]
 
     def run_schedule(self, model, caches, base, stop):
-        engine = BatchEngine(model, caches, base, stop_tokens=stop, capacity=64, max_batch=8)
+        engine = BatchEngine(
+            model, caches, base, stop_tokens=stop, capacity=64, max_batch=8, group=GROUP
+        )
         answers, reasons = {}, {}
         step = 0
         while step <= max(a[0] for a in self.ARRIVALS) or len(engine):
@@ -387,7 +389,7 @@ class SchedulerTest(unittest.TestCase):
         base = len(ids)
         requests = [(tokens(21, 6), 8), (tokens(22, 4), 6), (tokens(23, 9), 8), (tokens(24, 5), 300)]
         refs = [sharded_greedy(model, caches, base, q, min(m, 40))[0] for q, m in requests]
-        engine = BatchEngine(model, caches, base, capacity=400, max_batch=2)
+        engine = BatchEngine(model, caches, base, capacity=400, max_batch=2, group=GROUP)
         scheduler = Scheduler(engine, GROUP)
         got = {i: [] for i in range(len(requests))}
         finished = set()

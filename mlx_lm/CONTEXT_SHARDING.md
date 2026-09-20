@@ -187,15 +187,70 @@ quantized matrix multiplication unpacks the values again for every row. Same mod
 With one question the two paths take the same time. The kernel handles 8 and 4 bit
 values with group sizes that are a multiple of 8, and head sizes 64 and 128.
 
-Limits of this first version:
+Limits of `batch_query_scope`:
 
 - The batch is fixed. All questions start together, and a question that has
-  finished still takes a row until all are done.
+  finished still takes a row until all are done. Use the server below (or
+  `BatchEngine`) if questions arrive at different times.
 - The prefill of the questions still runs one after another.
 - Only caches that are sharded `KVCache` layers or `RotatingKVCache` layers work.
 - The kernel takes up to 64 rows (heads of a group times questions). Larger
   batches use a slower path.
 - The tokens of the questions are stored in 16-bit, even with an 8 or 4 bit cache.
+
+## Server with continuous batching
+
+Questions do not have to arrive together. The server keeps the model and the
+prepared cache loaded, and a new question joins the running batch at the next step.
+A question that has finished leaves at once. Prepare the text as before, then start
+the server on every machine:
+
+```
+mlx.launch --hosts 127.0.0.1 -n 2 --backend ring -- \
+    python -m mlx_lm.sharded_server \
+    --model mlx-community/Llama-3.2-1B-Instruct-4bit \
+    --cache-dir /tmp/context_cache --port 8080
+```
+
+Machine 0 listens on `--host` (default 127.0.0.1) and answers OpenAI-style requests:
+
+```
+curl localhost:8080/v1/chat/completions -H "Content-Type: application/json" \
+    -d '{"messages": [{"role": "user", "content": "What is the vault code?"}],
+         "max_tokens": 100, "stream": true}'
+```
+
+`GET /v1/models` and `GET /health` also work.
+
+What the server does with a request:
+
+- The last user message is the question. Other messages are ignored, because the
+  prepared text is the context.
+- The answer is greedy. `temperature` and similar options have no effect.
+- These fields work: `max_tokens` (or `max_completion_tokens`), `stream`,
+  `stream_options.include_usage`, `stop` (up to 4 strings). `usage.prompt_tokens`
+  counts the prepared text, and `prompt_tokens_details.cached_tokens` says how many
+  of them came from the cache.
+- A question that is too long for `--capacity` (question and answer together,
+  default 1024 tokens) gets an error 400. At most `--max-batch` questions (default
+  8) run together, the others wait, and more than 64 waiting ones get an error 503.
+  A client that disconnects frees its place.
+
+How it works: machine 0 tells the other machines at every step which questions to
+add or drop, and which token each question got, so all machines do the same work in
+the same order. A new question is prefilled alone before it joins. At 2000 cached
+tokens this took about 20 ms, and at 32000 tokens about 100 ms (a question of 100
+tokens about 230 ms). The running questions wait during that time. After a
+question ends, the prepared cache is as it was.
+
+Measured on one M3 Max with two local processes, Llama 3.2 1B, 2000 cached tokens,
+40 to 60 new tokens per question: 4 questions one after another gave 72 tokens per
+second, and 4 questions sent at the same moment gave 190 tokens per second.
+
+Limits: no authentication (do not open the port to a network you do not trust),
+no sampling other than greedy, no tool calls, and no conversation history. It was
+tested with plain HTTP requests, not with the official OpenAI client library. If a
+machine fails, the ring stops and the server must be restarted.
 
 ## How it works
 

@@ -265,6 +265,7 @@ def main():
         stop_tokens=stop_token_ids(tokenizer),
         capacity=args.capacity,
         max_batch=args.max_batch,
+        group=group,
     )
     scheduler = Scheduler(engine, group)
 

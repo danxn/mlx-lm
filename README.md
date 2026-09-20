@@ -93,6 +93,10 @@ Without `--batch` the questions run one after another. With `--batch` they are
 decoded together and each machine reads its part of the cache once for all of them.
 The cache can hold 16-bit values or be quantized to 8 or 4 bits (`--kv-bits`).
 
+For questions that arrive at different times there is an OpenAI-compatible server
+(`python -m mlx_lm.sharded_server`): a new question joins the running batch at the
+next step, see [mlx_lm/CONTEXT_SHARDING.md](mlx_lm/CONTEXT_SHARDING.md).
+
 Time of one decoding step, Llama 3.2 1B, 32768 tokens in the cache, M3 Max
 (each question gets one new token per step):
 
