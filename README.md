@@ -1,7 +1,12 @@
-## MLX LM 
+## MLX LM
 
 MLX LM is a Python package for generating text and fine-tuning large language
 models on Apple silicon with MLX.
+
+> **This is a fork of [ml-explore/mlx-lm](https://github.com/ml-explore/mlx-lm).**
+> It adds long-context inference with the KV cache split across several Macs, and
+> fast decoding of several questions about the same text at once. It is not part of
+> the upstream project. See [Context sharding](#context-sharding-this-fork) below.
 
 Some key features include:
 
@@ -12,8 +17,9 @@ Some key features include:
   fine-tuning](https://github.com/ml-explore/mlx-lm/blob/main/mlx_lm/LORA.md)
   with support for quantized models.
 * Distributed inference and fine-tuning with `mx.distributed`
-* [Long-context inference across several Macs](mlx_lm/CONTEXT_SHARDING.md)
-  with the KV cache split between the machines (experimental).
+* **Fork only:** [context sharding](mlx_lm/CONTEXT_SHARDING.md): prepare a long
+  text once, keep its KV cache split between several Macs, and ask many short
+  questions against it, alone or in batches.
 
 The easiest way to get started is to install the `mlx-lm` package:
 
@@ -28,6 +34,56 @@ pip install mlx-lm
 ```sh
 conda install -c conda-forge mlx-lm
 ```
+
+### Context sharding (this fork)
+
+Install this fork instead of the upstream package:
+
+```sh
+pip install git+https://github.com/danxn/mlx-lm.git
+```
+
+The idea: a large document is prepared once. Every machine keeps the whole model
+and only its own part of the KV cache, so the context can be longer than one Mac
+can hold. Short questions then run against that cache, and nothing is written to
+it, so the prepared text stays as it was. Machines exchange one small message per
+layer and step, so plain TCP over Ethernet or Thunderbolt is enough.
+
+```bash
+# On every machine, same text file. Two local processes for a first try:
+mlx.launch --hosts 127.0.0.1 -n 2 --backend ring -- \
+    python mlx_lm/examples/sharded_context.py prepare \
+    --model mlx-community/Llama-3.2-1B-Instruct-4bit \
+    --file document.txt --cache-dir /tmp/context_cache --block-size 256
+
+mlx.launch --hosts 127.0.0.1 -n 2 --backend ring -- \
+    python mlx_lm/examples/sharded_context.py ask \
+    --model mlx-community/Llama-3.2-1B-Instruct-4bit \
+    --cache-dir /tmp/context_cache --batch \
+    --question "What is the vault code?" --question "Who wrote the letter?"
+```
+
+Without `--batch` the questions run one after another. With `--batch` they are
+decoded together and each machine reads its part of the cache once for all of them.
+The cache can hold 16-bit values or be quantized to 8 or 4 bits (`--kv-bits`).
+
+Time of one decoding step, Llama 3.2 1B, 32768 tokens in the cache, M3 Max
+(each question gets one new token per step):
+
+| Questions | One by one | Batched, 16-bit cache | Batched, 8-bit cache |
+|---|---|---|---|
+| 1 | 10.6 ms | 10.6 ms | 10.7 ms |
+| 4 | 42 ms | 12.0 ms | 12.3 ms |
+| 8 | 85 ms | 16.5 ms | 16.6 ms |
+
+Works with Llama and Mistral, Qwen 2 and 3, and Gemma 1 to 4 (including Gemma 3 and
+4 image features). It was tested on two local processes, three local processes and
+a pair of Macs over Thunderbolt Bridge. The RDMA backend (JACCL) was not tested.
+Details, limits and more measurements are in
+[mlx_lm/CONTEXT_SHARDING.md](mlx_lm/CONTEXT_SHARDING.md), and the tests are in
+`tests/sharded_context_tests.py`.
+
+This code was written with the help of an AI assistant (Claude).
 
 ### Quick Start
 
