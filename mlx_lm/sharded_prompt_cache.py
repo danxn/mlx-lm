@@ -285,6 +285,24 @@ def query_scope(caches: List[Any], base: int):
             c.state = state
 
 
+def prefill_question(model, caches: List[Any], base: int, question):
+    """Run one question alone against the prepared cache, then roll back.
+
+    Returns ``(logits, own, windows)``: the logits of its last token, its own keys
+    and values for every sharded layer (``None`` on the ranks that do not keep
+    them) and a copy of the state of every ordinary (sliding window) layer.
+    """
+    sharded = [c for c in caches if isinstance(c, ShardedKVCache)]
+    marks = [c.local_offset for c in sharded]
+    with query_scope(caches, base):
+        logits = model(mx.array(question)[None], cache=caches)[:, -1, :]
+        mx.eval(logits)
+        own = [c.own_tokens(mark) if c.owns_new_token else None for c, mark in zip(sharded, marks)]
+        windows = [_snapshot(c) for c in caches if not isinstance(c, ShardedKVCache)]
+        mx.eval([x for pair in own if pair for x in pair])
+    return logits, own, windows
+
+
 @contextmanager
 def batch_query_scope(model, caches: List[Any], base: int, questions, max_new: int):
     """Decode several questions together against one prepared cache.
@@ -303,16 +321,12 @@ def batch_query_scope(model, caches: List[Any], base: int, questions, max_new: i
     own = [[] for _ in sharded]
     windows, rows = [], []
     for question in questions:
-        marks = [c.local_offset for c in sharded]
-        with query_scope(caches, base):
-            logits = model(mx.array(question)[None], cache=caches)[:, -1, :]
-            mx.eval(logits)
-            for j, (c, mark) in enumerate(zip(sharded, marks)):
-                own[j].append(c.own_tokens(mark) if c.owns_new_token else None)
-            windows.append(
-                [_snapshot(c) for c in caches if not isinstance(c, ShardedKVCache)]
-            )
-            mx.eval([x for layer in own for pair in layer[-1:] if pair for x in pair])
+        logits, question_own, question_windows = prefill_question(
+            model, caches, base, question
+        )
+        for j, pair in enumerate(question_own):
+            own[j].append(pair)
+        windows.append(question_windows)
         rows.append(logits)
 
     lengths = [len(q) for q in questions]

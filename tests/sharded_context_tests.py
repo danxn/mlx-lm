@@ -21,6 +21,7 @@ from mlx_lm import distributed_attention, fast_decode_attention
 from mlx_lm.models import gemma3_text, gemma4_text
 from mlx_lm.models.cache import KVCache, QuantizedKVCache, make_prompt_cache
 from mlx_lm.models.sharded_cache import ShardedKVCache
+from mlx_lm.sharded_batch_engine import BatchEngine
 from mlx_lm.sharded_prompt_cache import (
     _backbone,
     batch_query_scope,
@@ -295,6 +296,82 @@ class ShardedBatchTest(unittest.TestCase):
         for bits in (8, 4):
             with self.subTest(bits=bits):
                 self.check_family("llama", kv_bits=bits, tol=5e-2, context=900)
+
+
+def sharded_greedy(model, caches, base, question, count, stop=()):
+    """Greedy answer of one question on its own, and how it ended."""
+    out, reason = [], "length"
+    with query_scope(caches, base) as set_position:
+        logits = model(mx.array(question)[None], cache=caches)[:, -1, :]
+        for i in range(count):
+            token = mx.argmax(logits, axis=-1).astype(mx.int32)
+            mx.eval(token)  # evaluate every pass before the next one
+            if token.item() in stop:
+                reason = "stop"
+                break
+            out.append(token.item())
+            if i == count - 1:
+                break
+            set_position(base + len(question) + i)
+            logits = model(token[:, None], cache=caches)[:, -1, :]
+    return out, reason
+
+
+class ContinuousBatchTest(unittest.TestCase):
+    """Questions that join and leave a running batch get their one-by-one answers."""
+
+    # step at which the question arrives, seed, length, most new tokens
+    ARRIVALS = [(0, 11, 6, 8), (2, 12, 4, 5), (3, 13, 9, 8), (7, 14, 5, 6), (7, 15, 3, 4)]
+
+    def run_schedule(self, model, caches, base, stop):
+        engine = BatchEngine(model, caches, base, stop_tokens=stop, capacity=64, max_batch=8)
+        answers, reasons = {}, {}
+        step = 0
+        while step <= max(a[0] for a in self.ARRIVALS) or len(engine):
+            for i, (when, seed, length, most) in enumerate(self.ARRIVALS):
+                if when == step:
+                    engine.add(i, tokens(seed, length), most)
+                    answers[i] = []
+            for event in engine.step():
+                if event.token is not None:
+                    answers[event.uid].append(event.token)
+                if event.finish:
+                    reasons[event.uid] = event.finish
+            step += 1
+        return answers, reasons
+
+    def check_family(self, name, kv_bits=None):
+        model = build(name)
+        ids = tokens(1, 100)
+        caches = sharded_prefill(model, ids, kv_bits)
+        base = len(ids)
+        refs = [
+            sharded_greedy(model, caches, base, tokens(seed, length), most)
+            for _, seed, length, most in self.ARRIVALS
+        ]
+        # The third token of the first answer is a stop token for everybody.
+        stop = {refs[0][0][2]}
+        refs = [
+            sharded_greedy(model, caches, base, tokens(seed, length), most, stop)
+            for _, seed, length, most in self.ARRIVALS
+        ]
+        answers, reasons = self.run_schedule(model, caches, base, stop)
+        for i, (tokens_ref, reason_ref) in enumerate(refs):
+            self.assertEqual(answers[i], tokens_ref, f"question {i}")
+            self.assertEqual(reasons[i], reason_ref, f"question {i}")
+        self.assertIn("stop", reasons.values())
+        self.assertIn("length", reasons.values())
+        # Nothing is left in the prepared cache.
+        again, _ = sharded_greedy(model, caches, base, tokens(11, 6), 8, stop)
+        self.assertEqual(again, refs[0][0])
+
+    def test_families(self):
+        for name in ("llama", "qwen2", "gemma3_text", "gemma4_plain"):
+            with self.subTest(name):
+                self.check_family(name)
+
+    def test_quantized_cache(self):
+        self.check_family("llama", kv_bits=8)
 
 
 class FastKernelTest(unittest.TestCase):

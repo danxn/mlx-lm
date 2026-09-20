@@ -20,6 +20,7 @@ but must not add it to their own storage, or it would be double-counted
 across shards during the attention merge.
 """
 
+from contextlib import contextmanager
 from typing import Optional
 
 import mlx.core as mx
@@ -73,6 +74,7 @@ class ShardedKVCache(_BaseCache):
         # The own tokens of the questions live in ``suffix_*`` on one rank.
         self.batch_pos = None
         self.batch_base = 0
+        self.batch_capacity = 0
         self.suffix_keys = None
         self.suffix_values = None
 
@@ -190,6 +192,7 @@ class ShardedKVCache(_BaseCache):
         """Switch to batch mode. ``own`` has (keys, values) of the tokens of each
         question on the rank that keeps them, and ``None`` entries elsewhere."""
         self.batch_base = base
+        self.batch_capacity = capacity
         self.batch_pos = mx.array([base + n for n in lengths])
         if self.owns_new_token:
             k0, v0 = own[0]
@@ -203,6 +206,43 @@ class ShardedKVCache(_BaseCache):
     def end_batch(self):
         self.batch_pos = None
         self.suffix_keys = self.suffix_values = None
+
+    def extend_batch(self, own, length):
+        """Add one question of ``length`` tokens to the running batch. ``own`` is its
+        (keys, values) on the rank that keeps them, and ``None`` elsewhere."""
+        self.batch_pos = mx.concatenate(
+            [self.batch_pos, mx.array([self.batch_base + length])]
+        )
+        if self.owns_new_token:
+            keys, values = own
+            row_k = mx.zeros((1, *self.suffix_keys.shape[1:]), self.suffix_keys.dtype)
+            row_v = mx.zeros((1, *self.suffix_values.shape[1:]), self.suffix_values.dtype)
+            row_k[:, :, : keys.shape[2]] = keys
+            row_v[:, :, : values.shape[2]] = values
+            self.suffix_keys = mx.concatenate([self.suffix_keys, row_k], axis=0)
+            self.suffix_values = mx.concatenate([self.suffix_values, row_v], axis=0)
+
+    def filter_batch(self, keep):
+        """Keep only the questions at the positions ``keep`` (a list of indices)."""
+        index = mx.array(keep)
+        self.batch_pos = self.batch_pos[index]
+        if self.owns_new_token:
+            self.suffix_keys = self.suffix_keys[index]
+            self.suffix_values = self.suffix_values[index]
+
+    @contextmanager
+    def paused_batch(self):
+        """Leave batch mode for a while, for example to prefill a new question."""
+        saved = (
+            self.batch_pos,
+            self.suffix_keys,
+            self.suffix_values,
+        )
+        self.batch_pos = self.suffix_keys = self.suffix_values = None
+        try:
+            yield
+        finally:
+            self.batch_pos, self.suffix_keys, self.suffix_values = saved
 
     def _update_batch(self, keys, values):
         if self.owns_new_token:
