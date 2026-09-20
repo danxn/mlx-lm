@@ -13,6 +13,8 @@ import importlib
 import os
 import random
 import tempfile
+import threading
+import time
 import unittest
 
 import mlx.core as mx
@@ -22,6 +24,7 @@ from mlx_lm.models import gemma3_text, gemma4_text
 from mlx_lm.models.cache import KVCache, QuantizedKVCache, make_prompt_cache
 from mlx_lm.models.sharded_cache import ShardedKVCache
 from mlx_lm.sharded_batch_engine import BatchEngine
+from mlx_lm.sharded_scheduler import Scheduler
 from mlx_lm.sharded_prompt_cache import (
     _backbone,
     batch_query_scope,
@@ -372,6 +375,58 @@ class ContinuousBatchTest(unittest.TestCase):
 
     def test_quantized_cache(self):
         self.check_family("llama", kv_bits=8)
+
+
+class SchedulerTest(unittest.TestCase):
+    """Requests arrive at random moments on machine 0; all machines stay in step."""
+
+    def test_arrivals_queue_and_cancel(self):
+        model = build("llama")
+        ids = tokens(1, 100)
+        caches = sharded_prefill(model, ids, None)
+        base = len(ids)
+        requests = [(tokens(21, 6), 8), (tokens(22, 4), 6), (tokens(23, 9), 8), (tokens(24, 5), 300)]
+        refs = [sharded_greedy(model, caches, base, q, min(m, 40))[0] for q, m in requests]
+        engine = BatchEngine(model, caches, base, capacity=400, max_batch=2)
+        scheduler = Scheduler(engine, GROUP)
+        got = {i: [] for i in range(len(requests))}
+        finished = set()
+
+        def feeder():
+            uids = {}
+            for i, (question, most) in enumerate(requests):
+                time.sleep(0.03 * i)
+
+                def on_event(event, i=i):
+                    if event.token is not None:
+                        got[i].append(event.token)
+                    if event.finish:
+                        finished.add(i)
+
+                uids[i] = scheduler.submit(question, most, on_event)
+            deadline = time.time() + 60
+            while time.time() < deadline and not (
+                len(got[3]) >= 2 and {0, 1, 2} <= finished
+            ):
+                time.sleep(0.01)
+            scheduler.cancel(uids[3])
+            time.sleep(0.2)
+            scheduler.shutdown()
+
+        thread = threading.Thread(target=feeder) if GROUP.rank() == 0 else None
+        if thread:
+            thread.start()
+        scheduler.run()
+        if thread:
+            thread.join()
+            for i in range(3):
+                self.assertEqual(got[i], refs[i], f"request {i}")
+            self.assertGreaterEqual(len(got[3]), 2)
+            self.assertLess(len(got[3]), 40)
+            self.assertEqual(got[3], refs[3][: len(got[3])])
+        # The prepared cache is as it was.
+        again, _ = sharded_greedy(model, caches, base, requests[0][0], 8)
+        self.assertEqual(again, refs[0])
 
 
 class FastKernelTest(unittest.TestCase):

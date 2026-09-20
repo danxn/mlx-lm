@@ -124,6 +124,12 @@ class BatchEngine:
                 slot.pending = token
         return events
 
+    def cancel(self, uid):
+        """Drop one running question, if it is still running."""
+        keep = [i for i, s in enumerate(self.slots) if s.uid != uid]
+        if len(keep) < len(self.slots):
+            self._keep(keep)
+
     def _keep(self, keep: List[int]):
         if not keep:
             self.close()
