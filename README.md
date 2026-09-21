@@ -8,6 +8,20 @@ models on Apple silicon with MLX.
 > fast decoding of several questions about the same text at once. It is not part of
 > the upstream project. See [Context sharding](#context-sharding-this-fork) below.
 
+**Why a fork.** The features of this fork are not meant to go into the upstream
+repository, and they do not need to. MLX already has good low-level, mid-level and
+high-level building blocks, so with an AI coding assistant it is fast to adapt the
+library to your own needs. This fork is an example of that approach. The
+matrix-instruction attention kernel and the distributed attention solve a narrow,
+special task and are unlikely to be useful in MLX itself. The main task (the sharded
+KV cache with distributed attention) was done in about 1.4 hours of work with an AI
+coding agent. The weekend went into testing and packaging, and into extra
+experiments with optimization and batch processing (the matrix kernel, batched
+questions, continuous batching and the server). Those were not part of the main
+task. It is
+also common to keep several such libraries next to the standard one on the same
+machine and to run them as parts of a specialized solution.
+
 ![Several Mac minis and a laptop working as one local cluster](assets/Apple_Silicone_local_cluster.webp)
 
 *Concept illustration of a local Apple silicon cluster. The numbers on the screen
